@@ -4733,8 +4733,11 @@ dependencies = [
 name = "pomominders"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "gpui-fps",
  "gpui-kit",
+ "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

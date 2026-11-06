@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dirs = "6"
 gpui-fps = "0.9"
 gpui-kit = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # GPUI is too slow unoptimized (laggy animations); optimize deps, keep our crate quick to rebuild.
 [profile.dev.package."*"]

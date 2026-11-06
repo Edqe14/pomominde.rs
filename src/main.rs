@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use serde::{Deserialize, Serialize};
 
 actions!(pomominders, [Quit]);
 
@@ -385,6 +387,75 @@ fn setting_row(
         )
 }
 
+/// Settings on disk: `<config dir>/pomominders/settings.toml`, where the config dir is
+/// ~/Library/Application Support (macOS), $XDG_CONFIG_HOME or ~/.config (Linux), %APPDATA% (Windows).
+/// Missing keys fall back to defaults; an unreadable file is ignored.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Saved {
+    work_minutes: u64,
+    short_break_minutes: u64,
+    long_break_minutes: u64,
+    long_break_interval: u64,
+    auto_start: bool,
+    /// 0..=100
+    alarm_volume: f32,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Self::new(SETTINGS.map(|(_, default)| default), false, 100.)
+    }
+}
+
+impl Saved {
+    /// `values` are indexed like `SETTINGS`.
+    fn new([work, short, long, interval]: [u64; 4], auto_start: bool, alarm_volume: f32) -> Self {
+        Self {
+            work_minutes: work,
+            short_break_minutes: short,
+            long_break_minutes: long,
+            long_break_interval: interval,
+            auto_start,
+            alarm_volume,
+        }
+    }
+
+    fn values(&self) -> [u64; 4] {
+        [
+            self.work_minutes,
+            self.short_break_minutes,
+            self.long_break_minutes,
+            self.long_break_interval,
+        ]
+    }
+
+    fn path() -> Option<PathBuf> {
+        Some(
+            dirs::config_dir()?
+                .join("pomominders")
+                .join("settings.toml"),
+        )
+    }
+
+    fn load() -> Self {
+        Self::path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    // ponytail: plain overwrite, not atomic; a crash mid-write just resets to defaults.
+    fn store(&self) {
+        let Some(path) = Self::path() else { return };
+        let result = std::fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| std::fs::write(&path, toml::to_string(self).unwrap()));
+        if let Err(err) = result {
+            eprintln!("failed to save settings to {}: {err}", path.display());
+        }
+    }
+}
+
 /// Rendered inside the settings dialog; its own view so controls re-render while it's open.
 struct Settings {
     inputs: [Entity<InputState>; 4],
@@ -394,16 +465,22 @@ struct Settings {
 
 impl Settings {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let inputs = SETTINGS.map(|(_, default)| {
+        let saved = Saved::load();
+        let inputs = saved.values().map(|value| {
             let state = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .default_value(default.to_string())
+                    .default_value(value.to_string())
                     .step(1.)
                     .min(1.)
                     .max(999.)
             });
-            cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify())
-                .detach();
+            cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    this.save(cx);
+                }
+                cx.notify();
+            })
+            .detach();
             state
         });
         let volume = cx.new(|_| {
@@ -411,15 +488,27 @@ impl Settings {
                 .min(0.)
                 .max(100.)
                 .step(1.)
-                .default_value(100.)
+                .default_value(saved.alarm_volume.clamp(0., 100.))
         });
-        cx.subscribe(&volume, |_, _, _: &SliderEvent, cx| cx.notify())
-            .detach();
+        cx.subscribe(&volume, |this, _, _: &SliderEvent, cx| {
+            this.save(cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             inputs,
-            auto_start: false,
+            auto_start: saved.auto_start,
             volume,
         }
+    }
+
+    fn save(&self, cx: &App) {
+        Saved::new(
+            std::array::from_fn(|i| self.get(i, cx)),
+            self.auto_start,
+            self.volume.read(cx).value().end(),
+        )
+        .store();
     }
 
     fn get(&self, i: usize, cx: &App) -> u64 {
@@ -464,6 +553,7 @@ impl Render for Settings {
                             .checked(self.auto_start)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.auto_start = *checked;
+                                this.save(cx);
                                 cx.notify();
                             })),
                         cx,
@@ -804,7 +894,20 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stage, next_stage};
+    use super::{Saved, Stage, next_stage};
+
+    #[test]
+    fn saved_settings_round_trip_and_fill_missing_keys() {
+        let saved = Saved::new([50, 10, 20, 3], true, 40.);
+        let back: Saved = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(
+            (back.values(), back.auto_start, back.alarm_volume),
+            ([50, 10, 20, 3], true, 40.)
+        );
+
+        let partial: Saved = toml::from_str("work_minutes = 30").unwrap();
+        assert_eq!(partial.values(), [30, 5, 15, 4]);
+    }
 
     #[test]
     fn cycles_to_long_break_every_interval() {
