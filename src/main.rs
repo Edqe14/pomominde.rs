@@ -126,8 +126,13 @@ fn reveal<E: IntoElement>(
 /// `body` is centered on the origin in units of `1/scale` px; the result is a `w`×`h`
 /// box centered on its (relative) parent, tinted by `text_color` like any `svg()`.
 fn gaussian(body: &str, w: f32, h: f32, scale: f32, sigma: f32) -> Svg {
-    // Quantized: each distinct SVG is rasterized once and cached by content hash.
-    let sigma = (sigma * 2.).round() / 2.;
+    // resvg rasterizes on the main thread mid-animation, at 2x the box size (~200ms for
+    // the timer). Blur hides detail, so rasterize a box 1/d the size (d ~ sigma) and let
+    // the GPU scale it back up: cost falls with d². At least 4, since even d = 2 drops
+    // frames; the coarse low-sigma rasters only show while fading out under sharp text.
+    let d = 2f32.powi(sigma.max(4.).log2().floor() as i32);
+    // Quantized per raster px: each distinct SVG is rasterized once and cached.
+    let sigma = (sigma / d * 2.).round() / 2. * d;
     let doc = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}"><filter id="b" x="-1" y="-1" width="3" height="3"><feGaussianBlur stdDeviation="{}"/></filter><g filter="url(#b)">{}</g></svg>"##,
         -w / 2. / scale,
@@ -142,10 +147,11 @@ fn gaussian(body: &str, w: f32, h: f32, scale: f32, sigma: f32) -> Svg {
         .absolute()
         .left(relative(0.5))
         .top(relative(0.5))
-        .ml(px(-w / 2.))
-        .mt(px(-h / 2.))
-        .w(px(w))
-        .h(px(h))
+        .ml(px(-w / 2. / d))
+        .mt(px(-h / 2. / d))
+        .w(px(w / d))
+        .h(px(h / d))
+        .with_transformation(Transformation::scale(size(d, d)))
 }
 
 /// SVG text centered on the origin. GPUI centers the ascent+descent box in the line,
