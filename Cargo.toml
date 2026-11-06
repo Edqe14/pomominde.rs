@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+gpui-fps = "0.9"
 gpui-kit = "0.9"
 
 # GPUI is too slow unoptimized (laggy animations); optimize deps, keep our crate quick to rebuild.

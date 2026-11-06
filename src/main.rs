@@ -88,10 +88,12 @@ fn focus(p: f32) -> f32 {
 
 /// Startup blur-in. `blurred(sigma)` builds a stand-in laid out like `content` but drawn
 /// with a gaussian blur; it sharpens, then cross-fades to the real (interactive) element.
+/// `scrub` pins the intro timeline (debug panel).
 fn reveal<E: IntoElement>(
     id: &'static str,
     delay: f32,
     radius: f32,
+    scrub: Option<f32>,
     content: impl IntoElement,
     blurred: impl Fn(f32) -> E + 'static,
 ) -> Div {
@@ -100,13 +102,13 @@ fn reveal<E: IntoElement>(
         .child(div().child(content).with_animation(
             (id, 0usize),
             Animation::new(INTRO),
-            move |el, t| el.opacity(focus(intro_progress(t, delay))),
+            move |el, t| el.opacity(focus(intro_progress(scrub.unwrap_or(t), delay))),
         ))
         .child(div().absolute().inset_0().with_animation(
             (id, 1usize),
             Animation::new(INTRO),
             move |el, t| {
-                let p = intro_progress(t, delay);
+                let p = intro_progress(scrub.unwrap_or(t), delay);
                 let f = focus(p);
                 el.opacity((p * 3.).min(1.) * (1. - f))
                     .when(f < 1., |el| el.child(blurred(radius * (1. - p))))
@@ -495,12 +497,27 @@ struct Pomodoro {
     works_done: u64,
     settings: Entity<Settings>,
     ticker: Option<Task<()>>,
+    /// Debug panel (debug builds only): scrubs the intro; `None` until the slider moves.
+    timeline: Entity<SliderState>,
+    scrub: Option<f32>,
 }
 
 impl Pomodoro {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = cx.new(|cx| Settings::new(window, cx));
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        let timeline = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(1.)
+                .step(0.001)
+                .default_value(1.)
+        });
+        cx.subscribe(&timeline, |this, slider, _: &SliderEvent, cx| {
+            this.scrub = Some(slider.read(cx).value().end());
+            cx.notify();
+        })
+        .detach();
         Self {
             stage: Stage::Work,
             from: Stage::Work,
@@ -511,6 +528,8 @@ impl Pomodoro {
             works_done: 0,
             settings,
             ticker: None,
+            timeline,
+            scrub: None,
         }
     }
 
@@ -662,6 +681,7 @@ impl Render for Pomodoro {
         });
 
         let time = self.time_text(cx);
+        let scrub = self.scrub;
         v_flex()
             .relative()
             .size_full()
@@ -678,7 +698,7 @@ impl Render for Pomodoro {
             ))
             // Tabs stay in layout (`invisible`) so the timer does not shift when it starts.
             .child(
-                reveal("intro-tabs", 0., 8., tabs, move |sigma| {
+                reveal("intro-tabs", 0., 8., scrub, tabs, move |sigma| {
                     h_flex()
                         .gap_3()
                         .children(Stage::ALL.map(|s| blurred_pill(s, s == stage, sigma)))
@@ -689,6 +709,7 @@ impl Render for Pomodoro {
                 "intro-timer",
                 0.1,
                 16.,
+                scrub,
                 timer(time.clone()),
                 move |sigma| blurred_timer(time.clone(), sigma),
             ))
@@ -696,6 +717,7 @@ impl Render for Pomodoro {
                 "intro-buttons",
                 0.2,
                 8.,
+                scrub,
                 // Extras are removed (not invisible) so the pause button recenters.
                 h_flex().gap_3().child(toggle).children(extras),
                 move |sigma| {
@@ -714,11 +736,36 @@ impl Render for Pomodoro {
                     .inset_0()
                     .size_full()
                     .object_fit(ObjectFit::Fill)
-                    .with_animation("intro-grain", Animation::new(INTRO), |el, t| {
-                        let o = 0.3 * (1. - t).powi(2);
+                    .with_animation("intro-grain", Animation::new(INTRO), move |el, t| {
+                        let o = 0.3 * (1. - scrub.unwrap_or(t)).powi(2);
                         el.opacity(o).when(o < 0.001, |el| el.invisible())
                     }),
             )
+            .when(cfg!(debug_assertions), |el| {
+                el.child(gpui_fps::fps_monitor(window, cx)).child(
+                    v_flex()
+                        .absolute()
+                        .bottom_3()
+                        .left_3()
+                        .w(px(200.))
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(hsla(0., 0., 0., 0.35))
+                        .text_xs()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child("Intro timeline")
+                                .child(format!(
+                                    "{:.0} ms",
+                                    scrub.unwrap_or(1.) * INTRO.as_millis() as f32
+                                )),
+                        )
+                        .child(Slider::new(&self.timeline)),
+                )
+            })
     }
 }
 
