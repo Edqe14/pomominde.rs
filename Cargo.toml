@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 gpui-kit = "0.9"
+
+# GPUI is too slow unoptimized (laggy animations); optimize deps, keep our crate quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
