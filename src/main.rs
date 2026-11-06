@@ -72,6 +72,10 @@ fn faded(alpha: f32) -> Hsla {
 
 const INTRO: Duration = Duration::from_millis(2400);
 const SPRING: SpringConfig = SpringConfig::new(500., 30., 1.);
+/// Critically damped: for things that appear and disappear, where overshoot would wobble.
+/// How long the mouse rests before the pause button fades out.
+const IDLE: Duration = Duration::from_secs(3);
+const SETTLE: SpringConfig = SpringConfig::new(260., 32., 1.);
 
 /// Startup grain; resvg rasterizes it once and the overlay only fades.
 const GRAIN: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="450"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".85" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>"##;
@@ -206,6 +210,8 @@ fn hover_press(v: f32) -> (f32, f32) {
 }
 
 const BUTTON: f32 = 48.;
+/// Width of the reset and more buttons beside the toggle, gaps included.
+const EXTRAS: f32 = 2. * (12. + BUTTON);
 
 fn icon(svg: &'static [u8]) -> Icon {
     Icon::default().data(svg).size(px(BUTTON * 0.75))
@@ -668,6 +674,9 @@ struct Pomodoro {
     /// Timer characters as last rendered, and whether the latest change rolled down.
     slots: Vec<Slot>,
     rolls_down: bool,
+    /// Last mouse move over the window; the pause button hides after `IDLE` without one.
+    moved_at: Instant,
+    mouse: Option<Point<Pixels>>,
     /// Paused time left; `None` means the stage hasn't started yet.
     remaining: Option<Duration>,
     ends_at: Option<Instant>,
@@ -702,6 +711,8 @@ impl Pomodoro {
             grain: Arc::new(Image::from_bytes(ImageFormat::Svg, GRAIN.to_vec())),
             slots: Vec::new(),
             rolls_down: true,
+            moved_at: Instant::now(),
+            mouse: None,
             remaining: None,
             ends_at: None,
             works_done: 0,
@@ -749,8 +760,15 @@ impl Pomodoro {
         self.ends_at.is_some()
     }
 
+    /// Running with no recent mouse move: the ticker's re-renders pick this up.
+    fn idle(&self) -> bool {
+        self.running() && self.moved_at.elapsed() > IDLE
+    }
+
     fn start(&mut self, cx: &mut Context<Self>) {
         self.ends_at = Some(Instant::now() + self.left(cx));
+        // Idle counts from starting, so the pause button shows briefly before fading.
+        self.moved_at = Instant::now();
         self.ticker = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -826,15 +844,20 @@ impl Render for Pomodoro {
 
         let tabs = h_flex().gap_3().children(Stage::ALL.map(|s| {
             let (el, target) = pressable(s.label(), window, cx);
-            el.on_click(cx.listener(move |this, _, _, cx| this.set_stage(s, cx)))
-                .with_spring(
-                    s.label(),
-                    SpringAnimation::new(SPRING).to(target),
-                    move |el, v| {
-                        let (hover, press) = hover_press(v);
-                        el.child(pill(s, s == stage, hover, press))
-                    },
-                )
+            // Guarded: the tabs stay clickable while they fade out.
+            el.on_click(cx.listener(move |this, _, _, cx| {
+                if !this.running() {
+                    this.set_stage(s, cx)
+                }
+            }))
+            .with_spring(
+                s.label(),
+                SpringAnimation::new(SPRING).to(target),
+                move |el, v| {
+                    let (hover, press) = hover_press(v);
+                    el.child(pill(s, s == stage, hover, press))
+                },
+            )
         }));
 
         let toggle = icon_button(
@@ -844,23 +867,47 @@ impl Render for Pomodoro {
             window,
             cx,
         );
-        let extras = (!running).then(|| {
-            let reset = icon_button(
-                "reset",
-                RESET,
-                cx.listener(|this, _, _, cx| this.set_stage(this.stage, cx)),
-                window,
-                cx,
-            );
-            let more = icon_button(
-                "more",
-                MORE,
-                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
-                window,
-                cx,
-            );
-            h_flex().gap_3().child(reset).child(more)
-        });
+        // Guarded like the tabs.
+        let reset = icon_button(
+            "reset",
+            RESET,
+            cx.listener(|this, _, _, cx| {
+                if !this.running() {
+                    this.set_stage(this.stage, cx)
+                }
+            }),
+            window,
+            cx,
+        );
+        let more = icon_button(
+            "more",
+            MORE,
+            cx.listener(|this, _, window, cx| {
+                if !this.running() {
+                    this.open_settings(window, cx)
+                }
+            }),
+            window,
+            cx,
+        );
+        // 1 while paused, 0 while running: drives hiding the tabs and extras.
+        let shown = if running { 0. } else { 1. };
+        // While running, the extras collapse to zero width so the toggle glides to center.
+        let extras = div()
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .pl_3()
+                    .gap_3()
+                    .child(reset)
+                    .child(more),
+            )
+            .with_spring("extras", SpringAnimation::new(SETTLE).to(shown), |el, v| {
+                let v = v.clamp(0., 1.);
+                el.w(px(EXTRAS * v))
+                    .opacity(v)
+                    .when(v < 0.01, |el| el.invisible())
+            });
 
         let time = self.time_text(cx);
         if let Some(down) = roll(&mut self.slots, &time) {
@@ -868,6 +915,22 @@ impl Render for Pomodoro {
         }
         let scrub = self.scrub;
         v_flex()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                // Only real motion counts: skip repeats at the same spot, and the first
+                // event, which just reports where the cursor already was.
+                if this
+                    .mouse
+                    .replace(event.position)
+                    .is_none_or(|p| p == event.position)
+                {
+                    return;
+                }
+                let was_idle = this.idle();
+                this.moved_at = Instant::now();
+                if was_idle {
+                    cx.notify();
+                }
+            }))
             .relative()
             .size_full()
             .items_center()
@@ -881,14 +944,21 @@ impl Render for Pomodoro {
                 Animation::new(Duration::from_millis(450)).with_easing(ease_in_out),
                 |el, t| el.opacity(t),
             ))
-            // Tabs stay in layout (`invisible`) so the timer does not shift when it starts.
+            // Tabs fade but stay in layout so the timer does not shift when it starts.
             .child(
                 reveal("intro-tabs", 0., 8., scrub, tabs, move |sigma| {
                     h_flex()
                         .gap_3()
                         .children(Stage::ALL.map(|s| blurred_pill(s, s == stage, sigma)))
                 })
-                .when(running, |this| this.invisible()),
+                .with_spring(
+                    "tabs",
+                    SpringAnimation::new(SETTLE).to(shown),
+                    |el, v| {
+                        let v = v.clamp(0., 1.);
+                        el.opacity(v).when(v < 0.01, |el| el.invisible())
+                    },
+                ),
             )
             .child(reveal(
                 "intro-timer",
@@ -903,8 +973,13 @@ impl Render for Pomodoro {
                 0.2,
                 8.,
                 scrub,
-                // Extras are removed (not invisible) so the pause button recenters.
-                h_flex().gap_3().child(toggle).children(extras),
+                h_flex()
+                    .child(div().child(toggle).with_spring(
+                        "toggle-idle",
+                        SpringAnimation::new(SETTLE).to(if self.idle() { 0. } else { 1. }),
+                        |el, v| el.opacity(v.clamp(0., 1.)),
+                    ))
+                    .child(extras),
                 move |sigma| {
                     h_flex()
                         .gap_3()
