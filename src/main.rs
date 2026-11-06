@@ -1,12 +1,13 @@
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::dialog::{DialogClose, DialogFooter};
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -67,18 +68,271 @@ fn faded(alpha: f32) -> Hsla {
     hsla(0., 0., 1., alpha)
 }
 
-// Button draws its icon at 75% of the button size.
-fn icon_button(id: &'static str, svg: &[u8], cx: &App) -> Button {
-    Button::new(id)
-        .custom(
-            ButtonCustomVariant::new(cx)
-                .foreground(faded(0.5))
-                .hover(faded(0.08))
-                .active(faded(0.15)),
+const INTRO: Duration = Duration::from_millis(2400);
+const SPRING: SpringConfig = SpringConfig::new(500., 30., 1.);
+
+/// Startup grain; resvg rasterizes it once and the overlay only fades.
+const GRAIN: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="450"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".85" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>"##;
+
+/// Eased 0..1 progress of the intro for a section starting `delay` (fraction of INTRO) in.
+fn intro_progress(t: f32, delay: f32) -> f32 {
+    let x = ((t - delay) / (1. - delay)).clamp(0., 1.);
+    1. - (1. - x).powi(3)
+}
+
+/// Hand-off from the blurred stand-in to the real element over the last quarter.
+fn focus(p: f32) -> f32 {
+    let x = ((p - 0.75) / 0.25).clamp(0., 1.);
+    x * x * (3. - 2. * x)
+}
+
+/// Startup blur-in. `blurred(sigma)` builds a stand-in laid out like `content` but drawn
+/// with a gaussian blur; it sharpens, then cross-fades to the real (interactive) element.
+fn reveal<E: IntoElement>(
+    id: &'static str,
+    delay: f32,
+    radius: f32,
+    content: impl IntoElement,
+    blurred: impl Fn(f32) -> E + 'static,
+) -> Div {
+    div()
+        .relative()
+        .child(div().child(content).with_animation(
+            (id, 0usize),
+            Animation::new(INTRO),
+            move |el, t| el.opacity(focus(intro_progress(t, delay))),
+        ))
+        .child(div().absolute().inset_0().with_animation(
+            (id, 1usize),
+            Animation::new(INTRO),
+            move |el, t| {
+                let p = intro_progress(t, delay);
+                let f = focus(p);
+                el.opacity((p * 3.).min(1.) * (1. - f))
+                    .when(f < 1., |el| el.child(blurred(radius * (1. - p))))
+            },
+        ))
+}
+
+/// Gaussian-blurred SVG, rasterized by resvg since GPUI has no element filters.
+/// `body` is centered on the origin in units of `1/scale` px; the result is a `w`×`h`
+/// box centered on its (relative) parent, tinted by `text_color` like any `svg()`.
+fn gaussian(body: &str, w: f32, h: f32, scale: f32, sigma: f32) -> Svg {
+    // Quantized: each distinct SVG is rasterized once and cached by content hash.
+    let sigma = (sigma * 2.).round() / 2.;
+    let doc = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}"><filter id="b" x="-1" y="-1" width="3" height="3"><feGaussianBlur stdDeviation="{}"/></filter><g filter="url(#b)">{}</g></svg>"##,
+        -w / 2. / scale,
+        -h / 2. / scale,
+        w / scale,
+        h / scale,
+        sigma / scale,
+        body
+    );
+    svg()
+        .data(doc.as_bytes())
+        .absolute()
+        .left(relative(0.5))
+        .top(relative(0.5))
+        .ml(px(-w / 2.))
+        .mt(px(-h / 2.))
+        .w(px(w))
+        .h(px(h))
+}
+
+/// SVG text centered on the origin. GPUI centers the ascent+descent box in the line,
+/// which puts the baseline ~0.379em below center for both fonts used here.
+fn svg_text(text: &str, family: &str, size: f32) -> String {
+    format!(
+        r#"<text y="{}" text-anchor="middle" font-family="{family}" font-weight="500" font-size="{size}">{text}</text>"#,
+        0.379 * size
+    )
+}
+
+/// Clickable element whose hover/press feed a spring target: 0 idle, 1 hovered, 2 pressed.
+/// GPUI's `.hover()`/`.active()` styles snap, so the state is tracked by hand.
+fn pressable(id: &'static str, window: &mut Window, cx: &mut App) -> (Stateful<Div>, f32) {
+    let state = window.use_keyed_state((id, 0usize), cx, |_, _| (false, false));
+    let (hovered, pressed) = *state.read(cx);
+    let set = |f: fn(&mut (bool, bool))| {
+        let state = state.clone();
+        move |cx: &mut App| {
+            state.update(cx, |s, cx| {
+                f(s);
+                cx.notify()
+            })
+        }
+    };
+    let (down, up, up_out) = (
+        set(|s| s.1 = true),
+        set(|s| s.1 = false),
+        set(|s| s.1 = false),
+    );
+    let hover = state.clone();
+    let el = div()
+        .id(id)
+        .cursor_pointer()
+        .on_hover(move |&h, _, cx| {
+            hover.update(cx, |s, cx| {
+                s.0 = h;
+                cx.notify()
+            })
+        })
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            down(cx)
+        })
+        .on_mouse_up(MouseButton::Left, move |_, _, cx| up(cx))
+        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| up_out(cx));
+    (
+        el,
+        if pressed {
+            2.
+        } else if hovered {
+            1.
+        } else {
+            0.
+        },
+    )
+}
+
+/// Splits a `pressable` spring value into (hover, press) amounts.
+fn hover_press(v: f32) -> (f32, f32) {
+    (v.clamp(0., 1.), (v - 1.).max(0.))
+}
+
+const BUTTON: f32 = 48.;
+
+fn icon(svg: &'static [u8]) -> Icon {
+    Icon::default().data(svg).size(px(BUTTON * 0.75))
+}
+
+/// Blurred, non-interactive stand-in for an `icon_button`.
+fn blurred_icon(svg: &'static [u8], sigma: f32) -> Div {
+    // Nest the icon document as a 24-unit box centered on the origin.
+    let doc = std::str::from_utf8(svg).unwrap();
+    let body = doc.replacen(
+        "<svg ",
+        r#"<svg x="-12" y="-12" width="24" height="24" "#,
+        1,
+    );
+    div().relative().size(px(BUTTON)).child(
+        gaussian(&body, BUTTON * 2., BUTTON * 2., BUTTON * 0.75 / 24., sigma)
+            .text_color(faded(0.5)),
+    )
+}
+
+fn icon_button(
+    id: &'static str,
+    svg: &'static [u8],
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let (el, target) = pressable(id, window, cx);
+    el.size(px(BUTTON))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_click(on_click)
+        .with_spring(id, SpringAnimation::new(SPRING).to(target), move |el, v| {
+            let (hover, press) = hover_press(v);
+            let scale = 1. - 0.08 * press;
+            el.child(
+                div()
+                    .absolute()
+                    .top(px(BUTTON / 2. * (1. - scale)))
+                    .left(px(BUTTON / 2. * (1. - scale)))
+                    .size(px(BUTTON * scale))
+                    .rounded_full()
+                    .bg(faded(0.08 * hover + 0.07 * press)),
+            )
+            .child(
+                icon(svg)
+                    .text_color(faded(0.5 + 0.35 * hover))
+                    .transform(Transformation::scale(size(scale, scale))),
+            )
+        })
+        .into_any_element()
+}
+
+/// (background, text) alpha of a tab pill.
+fn pill_alpha(active: bool, hover: f32, press: f32) -> (f32, f32) {
+    if active {
+        (0.15, 0.9)
+    } else {
+        (0.04 + 0.06 * hover + 0.05 * press, 0.5 + 0.25 * hover)
+    }
+}
+
+fn pill(stage: Stage, active: bool, hover: f32, press: f32) -> Div {
+    let (bg, fg) = pill_alpha(active, hover, press);
+    div()
+        .px_4()
+        .py_1p5()
+        .rounded_full()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .bg(faded(bg))
+        .text_color(faded(fg))
+        .child(stage.label())
+}
+
+/// Blurred, non-interactive stand-in for a `pill`: the background is a native
+/// (gaussian) shadow, the label a blurred SVG over an invisible layout copy.
+fn blurred_pill(stage: Stage, active: bool, sigma: f32) -> Div {
+    let (bg, fg) = pill_alpha(active, 0., 0.);
+    pill(stage, active, 0., 0.)
+        .relative()
+        .bg(transparent_black())
+        .text_color(transparent_black())
+        .shadow(vec![BoxShadow {
+            color: faded(bg),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(sigma * 2.),
+            spread_radius: px(0.),
+            inset: false,
+        }])
+        .child(
+            gaussian(
+                &svg_text(stage.label(), "SF Pro Text, Helvetica Neue", 14.),
+                240.,
+                96.,
+                1.,
+                sigma,
+            )
+            .text_color(faded(fg)),
         )
-        .rounded(px(999.))
-        .icon(Icon::default().data(svg))
-        .with_size(px(48.))
+}
+
+const TIMER_FONT: &str = "Helvetica Neue";
+const TIMER_SIZE: f32 = 112.;
+
+fn blurred_timer(text: String, sigma: f32) -> Div {
+    timer(text.clone())
+        .relative()
+        .text_color(transparent_black())
+        .child(
+            gaussian(
+                &svg_text(&text, TIMER_FONT, TIMER_SIZE),
+                560.,
+                260.,
+                1.,
+                sigma,
+            )
+            .text_color(rgb(0xDEDDE2)),
+        )
+}
+
+fn timer(text: String) -> Div {
+    // Not the system font: SF swaps optical-size outlines at large sizes, but GPUI
+    // measures glyph bounds from the small-size outlines, so edges get clipped.
+    div()
+        .font_family(TIMER_FONT)
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(px(TIMER_SIZE))
+        .line_height(px(120.))
+        .child(text)
 }
 
 // Lucide, inlined: the default `assets::Assets` bundle doesn't include these.
@@ -231,6 +485,10 @@ impl Render for Settings {
 
 struct Pomodoro {
     stage: Stage,
+    /// Stage being cross-faded away from, and a counter that restarts the fade.
+    from: Stage,
+    switches: usize,
+    grain: Arc<Image>,
     /// Paused time left; `None` means the stage hasn't started yet.
     remaining: Option<Duration>,
     ends_at: Option<Instant>,
@@ -245,6 +503,9 @@ impl Pomodoro {
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         Self {
             stage: Stage::Work,
+            from: Stage::Work,
+            switches: 0,
+            grain: Arc::new(Image::from_bytes(ImageFormat::Svg, GRAIN.to_vec())),
             remaining: None,
             ends_at: None,
             works_done: 0,
@@ -318,6 +579,8 @@ impl Pomodoro {
     }
 
     fn set_stage(&mut self, stage: Stage, cx: &mut Context<Self>) {
+        self.from = self.stage;
+        self.switches += 1;
         self.stage = stage;
         self.remaining = None;
         self.ends_at = None;
@@ -356,73 +619,104 @@ impl Pomodoro {
 }
 
 impl Render for Pomodoro {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.running();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (running, stage) = (self.running(), self.stage);
+        let toggle_svg = if running { PAUSE } else { PLAY };
 
+        let tabs = h_flex().gap_3().children(Stage::ALL.map(|s| {
+            let (el, target) = pressable(s.label(), window, cx);
+            el.on_click(cx.listener(move |this, _, _, cx| this.set_stage(s, cx)))
+                .with_spring(
+                    s.label(),
+                    SpringAnimation::new(SPRING).to(target),
+                    move |el, v| {
+                        let (hover, press) = hover_press(v);
+                        el.child(pill(s, s == stage, hover, press))
+                    },
+                )
+        }));
+
+        let toggle = icon_button(
+            "toggle",
+            toggle_svg,
+            cx.listener(|this, _, _, cx| this.toggle(cx)),
+            window,
+            cx,
+        );
+        let extras = (!running).then(|| {
+            let reset = icon_button(
+                "reset",
+                RESET,
+                cx.listener(|this, _, _, cx| this.set_stage(this.stage, cx)),
+                window,
+                cx,
+            );
+            let more = icon_button(
+                "more",
+                MORE,
+                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                window,
+                cx,
+            );
+            h_flex().gap_3().child(reset).child(more)
+        });
+
+        let time = self.time_text(cx);
         v_flex()
+            .relative()
             .size_full()
             .items_center()
             .justify_center()
             .gap_6()
-            .bg(self.stage.color())
+            .bg(self.from.color())
             .text_color(rgb(0xDEDDE2))
             .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+            .child(div().absolute().inset_0().bg(stage.color()).with_animation(
+                ("fade", self.switches),
+                Animation::new(Duration::from_millis(450)).with_easing(ease_in_out),
+                |el, t| el.opacity(t),
+            ))
             // Tabs stay in layout (`invisible`) so the timer does not shift when it starts.
             .child(
-                h_flex()
-                    .gap_3()
-                    .when(running, |this| this.invisible())
-                    .children(Stage::ALL.map(|stage| {
-                        let active = stage == self.stage;
-                        div()
-                            .id(stage.label())
-                            .px_4()
-                            .py_1p5()
-                            .rounded_full()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .cursor_pointer()
-                            .bg(faded(if active { 0.15 } else { 0.04 }))
-                            .text_color(if active { faded(0.9) } else { faded(0.5) })
-                            .hover(|s| s.bg(faded(0.1)))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_stage(stage, cx)))
-                            .child(stage.label())
-                    })),
+                reveal("intro-tabs", 0., 8., tabs, move |sigma| {
+                    h_flex()
+                        .gap_3()
+                        .children(Stage::ALL.map(|s| blurred_pill(s, s == stage, sigma)))
+                })
+                .when(running, |this| this.invisible()),
             )
+            .child(reveal(
+                "intro-timer",
+                0.1,
+                16.,
+                timer(time.clone()),
+                move |sigma| blurred_timer(time.clone(), sigma),
+            ))
+            .child(reveal(
+                "intro-buttons",
+                0.2,
+                8.,
+                // Extras are removed (not invisible) so the pause button recenters.
+                h_flex().gap_3().child(toggle).children(extras),
+                move |sigma| {
+                    h_flex()
+                        .gap_3()
+                        .child(blurred_icon(toggle_svg, sigma))
+                        .when(!running, |el| {
+                            el.child(blurred_icon(RESET, sigma))
+                                .child(blurred_icon(MORE, sigma))
+                        })
+                },
+            ))
             .child(
-                // Not the system font: SF swaps optical-size outlines at large sizes, but GPUI
-                // measures glyph bounds from the small-size outlines, so edges get clipped.
-                div()
-                    .font_family("Helvetica Neue")
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_size(px(112.))
-                    .line_height(px(120.))
-                    .child(self.time_text(cx)),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        icon_button("toggle", if running { PAUSE } else { PLAY }, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle(cx))),
-                    )
-                    // Removed (not invisible) so the pause button recenters; row height is unchanged.
-                    .when(!running, |this| {
-                        this.child(
-                            h_flex()
-                                .gap_3()
-                                .child(icon_button("reset", RESET, cx).on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        let stage = this.stage;
-                                        this.set_stage(stage, cx)
-                                    },
-                                )))
-                                .child(icon_button("more", MORE, cx).on_click(cx.listener(
-                                    |this, _, window, cx| this.open_settings(window, cx),
-                                ))),
-                        )
+                img(self.grain.clone())
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Fill)
+                    .with_animation("intro-grain", Animation::new(INTRO), |el, t| {
+                        let o = 0.3 * (1. - t).powi(2);
+                        el.opacity(o).when(o < 0.001, |el| el.invisible())
                     }),
             )
     }
