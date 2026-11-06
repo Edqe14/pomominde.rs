@@ -13,7 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
-actions!(pomominders, [Quit]);
+actions!(pomominders, [Quit, OpenSettings]);
 
 const PLAY: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="1" stroke-linejoin="round"><circle cx="12" cy="12" r="11.5"/><path d="M9.5 7.5v9l7-4.5z"/></svg>"##;
 const PAUSE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round"><circle cx="12" cy="12" r="11.5"/><path d="M10.5 8.5v7M13.5 8.5v7"/></svg>"##;
@@ -628,6 +628,9 @@ impl Pomodoro {
     }
 
     fn open_settings(&self, window: &mut Window, cx: &mut App) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
         let settings = self.settings.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -859,11 +862,37 @@ impl Render for Pomodoro {
     }
 }
 
+/// A bundled .app gets its icon from Info.plist; this covers unbundled runs (`cargo run`).
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread as _, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    if let (Some(mtm), Some(image)) = (
+        MainThreadMarker::new(),
+        NSImage::initWithData(NSImage::alloc(), &data),
+    ) {
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+    }
+}
+
 fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.set_menus([Menu::new("Pomominders").items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit Pomominders", Quit),
+        ])]);
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -884,10 +913,20 @@ fn main() {
             }),
             ..Default::default()
         };
-        open_window(options, cx, |window, cx| {
+        let (handle, view) = open_window(options, cx, |window, cx| {
             cx.new(|cx| Pomodoro::new(window, cx))
         })
         .expect("failed to open window");
+        // App-level so the menu item stays enabled with nothing focused. Deferred because
+        // global actions run while the window is mid-update, so it can't be borrowed here.
+        cx.on_action(move |_: &OpenSettings, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| this.open_settings(window, cx))
+                });
+            });
+        });
         cx.activate(true);
     });
 }

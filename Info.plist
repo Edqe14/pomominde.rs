@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- No CFBundleIdentifier: GPUI would then use UserNotifications, which crashes outside a real .app. -->
+	<key>CFBundleName</key>
+	<string>Pomominders</string>
+	<key>CFBundleDisplayName</key>
+	<string>Pomominders</string>
+</dict>
+</plist>
