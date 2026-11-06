@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,7 +72,7 @@ fn faded(alpha: f32) -> Hsla {
     hsla(0., 0., 1., alpha)
 }
 
-const INTRO: Duration = Duration::from_millis(2400);
+const INTRO: Duration = Duration::from_millis(700);
 const SPRING: SpringConfig = SpringConfig::new(500., 30., 1.);
 /// Critically damped: for things that appear and disappear, where overshoot would wobble.
 /// How long the mouse rests before the pause button fades out.
@@ -92,9 +94,19 @@ fn focus(p: f32) -> f32 {
     x * x * (3. - 2. * x)
 }
 
-/// Startup blur-in. `blurred(sigma)` builds a stand-in laid out like `content` but drawn
-/// with a gaussian blur; it sharpens, then cross-fades to the real (interactive) element.
-/// `scrub` pins the intro timeline (debug panel).
+/// Peak blur of the intro, for the native (whole-window) blur.
+const INTRO_BLUR: f32 = 24.;
+/// Peak grain (`CIDither` intensity) of the native blur.
+#[cfg(target_os = "macos")]
+const NATIVE_GRAIN: f32 = 0.12;
+
+/// macOS blurs the whole window natively (`set_window_blur`); elsewhere each section
+/// gets a blurred SVG stand-in.
+const NATIVE_BLUR: bool = cfg!(target_os = "macos");
+
+/// Startup fade-in, staggered by `delay`. Without native blur, `blurred(sigma)` builds a
+/// stand-in laid out like `content` but drawn with a gaussian blur; it sharpens, then
+/// cross-fades to the real (interactive) element. `scrub` pins the intro timeline (debug panel).
 fn reveal<E: IntoElement>(
     id: &'static str,
     delay: f32,
@@ -108,18 +120,23 @@ fn reveal<E: IntoElement>(
         .child(div().child(content).with_animation(
             (id, 0usize),
             Animation::new(INTRO),
-            move |el, t| el.opacity(focus(intro_progress(scrub.unwrap_or(t), delay))),
-        ))
-        .child(div().absolute().inset_0().with_animation(
-            (id, 1usize),
-            Animation::new(INTRO),
             move |el, t| {
                 let p = intro_progress(scrub.unwrap_or(t), delay);
-                let f = focus(p);
-                el.opacity((p * 3.).min(1.) * (1. - f))
-                    .when(f < 1., |el| el.child(blurred(radius * (1. - p))))
+                el.opacity(if NATIVE_BLUR { p } else { focus(p) })
             },
         ))
+        .when(!NATIVE_BLUR, |el| {
+            el.child(div().absolute().inset_0().with_animation(
+                (id, 1usize),
+                Animation::new(INTRO),
+                move |el, t| {
+                    let p = intro_progress(scrub.unwrap_or(t), delay);
+                    let f = focus(p);
+                    el.opacity((p * 3.).min(1.) * (1. - f))
+                        .when(f < 1., |el| el.child(blurred(radius * (1. - p))))
+                },
+            ))
+        })
 }
 
 /// Gaussian-blurred SVG, rasterized by resvg since GPUI has no element filters.
@@ -680,6 +697,11 @@ struct Pomodoro {
     /// Timer characters as last rendered, and whether the latest change rolled down.
     slots: Vec<Slot>,
     rolls_down: bool,
+    /// Intro clock for the native blur, and the radius last applied.
+    launched: Instant,
+    blur: f32,
+    /// Debug overlays' bounds from the last frame, kept sharp by the native blur.
+    unblurred: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// Last mouse move over the window; the pause button hides after `IDLE` without one.
     moved_at: Instant,
     mouse: Option<Point<Pixels>>,
@@ -689,8 +711,10 @@ struct Pomodoro {
     works_done: u64,
     settings: Entity<Settings>,
     ticker: Option<Task<()>>,
-    /// Debug panel (debug builds only): scrubs the intro; `None` until the slider moves.
+    /// Debug panel slider (debug builds only), scrubbing the intro.
+    #[cfg(debug_assertions)]
     timeline: Entity<SliderState>,
+    /// Pinned intro time from the debug panel; always `None` in release builds.
     scrub: Option<f32>,
 }
 
@@ -698,18 +722,22 @@ impl Pomodoro {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = cx.new(|cx| Settings::new(window, cx));
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
-        let timeline = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(1.)
-                .step(0.001)
-                .default_value(1.)
-        });
-        cx.subscribe(&timeline, |this, slider, _: &SliderEvent, cx| {
-            this.scrub = Some(slider.read(cx).value().end());
-            cx.notify();
-        })
-        .detach();
+        #[cfg(debug_assertions)]
+        let timeline = {
+            let timeline = cx.new(|_| {
+                SliderState::new()
+                    .min(0.)
+                    .max(1.)
+                    .step(0.001)
+                    .default_value(1.)
+            });
+            cx.subscribe(&timeline, |this, slider, _: &SliderEvent, cx| {
+                this.scrub = Some(slider.read(cx).value().end());
+                cx.notify();
+            })
+            .detach();
+            timeline
+        };
         Self {
             stage: Stage::Work,
             from: Stage::Work,
@@ -717,6 +745,9 @@ impl Pomodoro {
             grain: Arc::new(Image::from_bytes(ImageFormat::Svg, GRAIN.to_vec())),
             slots: Vec::new(),
             rolls_down: true,
+            launched: Instant::now(),
+            blur: -1.,
+            unblurred: Rc::default(),
             moved_at: Instant::now(),
             mouse: None,
             remaining: None,
@@ -724,6 +755,7 @@ impl Pomodoro {
             works_done: 0,
             settings,
             ticker: None,
+            #[cfg(debug_assertions)]
             timeline,
             scrub: None,
         }
@@ -915,12 +947,25 @@ impl Render for Pomodoro {
                     .when(v < 0.01, |el| el.invisible())
             });
 
+        #[cfg(target_os = "macos")]
+        {
+            let elapsed = self.launched.elapsed().as_secs_f32() / INTRO.as_secs_f32();
+            let t = self.scrub.unwrap_or(elapsed).min(1.);
+            let radius = INTRO_BLUR * (1. - intro_progress(t, 0.1));
+            if radius != self.blur {
+                set_window_blur(window, radius, self.stage.color(), &self.unblurred.borrow());
+                self.blur = radius;
+            }
+            if t < 1. {
+                window.request_animation_frame();
+            }
+        }
         let time = self.time_text(cx);
         if let Some(down) = roll(&mut self.slots, &time) {
             self.rolls_down = down;
         }
         let scrub = self.scrub;
-        v_flex()
+        let root = v_flex()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 // Only real motion counts: skip repeats at the same spot, and the first
                 // event, which just reports where the cursor already was.
@@ -996,42 +1041,154 @@ impl Render for Pomodoro {
                         })
                 },
             ))
-            .child(
-                img(self.grain.clone())
-                    .absolute()
-                    .inset_0()
-                    .size_full()
-                    .object_fit(ObjectFit::Fill)
-                    .with_animation("intro-grain", Animation::new(INTRO), move |el, t| {
-                        let o = 0.3 * (1. - scrub.unwrap_or(t)).powi(2);
-                        el.opacity(o).when(o < 0.001, |el| el.invisible())
-                    }),
-            )
-            .when(cfg!(debug_assertions), |el| {
-                el.child(gpui_fps::fps_monitor(window, cx)).child(
-                    v_flex()
+            // Native blur draws its own grain (see `set_window_blur`).
+            .when(!NATIVE_BLUR, |el| {
+                el.child(
+                    img(self.grain.clone())
                         .absolute()
-                        .bottom_3()
-                        .left_3()
-                        .w(px(200.))
-                        .gap_2()
-                        .p_3()
-                        .rounded_lg()
-                        .bg(hsla(0., 0., 0., 0.35))
-                        .text_xs()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .child("Intro timeline")
-                                .child(format!(
-                                    "{:.0} ms",
-                                    scrub.unwrap_or(1.) * INTRO.as_millis() as f32
-                                )),
-                        )
-                        .child(Slider::new(&self.timeline)),
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Fill)
+                        .with_animation("intro-grain", Animation::new(INTRO), move |el, t| {
+                            let o = 0.3 * (1. - scrub.unwrap_or(t)).powi(2);
+                            el.opacity(o).when(o < 0.001, |el| el.invisible())
+                        }),
                 )
-            })
+            });
+        #[cfg(debug_assertions)]
+        let root = self.debug_overlays(root, window, cx);
+        root
+    }
+}
+
+impl Pomodoro {
+    /// FPS monitor and intro scrubber, kept sharp by the native blur.
+    #[cfg(debug_assertions)]
+    fn debug_overlays(&self, el: Div, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let scrub = self.scrub;
+        let unblurred = self.unblurred.clone();
+        // The debug overlays are the last two children.
+        el.on_children_prepainted(move |bounds, _, _| {
+            *unblurred.borrow_mut() = bounds[bounds.len() - 2..].to_vec();
+        })
+        .child(gpui_fps::fps_monitor(window, cx))
+        .child(
+            v_flex()
+                .absolute()
+                .bottom_3()
+                .left_3()
+                .w(px(200.))
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .bg(hsla(0., 0., 0., 0.35))
+                .text_xs()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .child("Intro timeline")
+                        .child(format!(
+                            "{:.0} ms",
+                            scrub.unwrap_or(1.) * INTRO.as_millis() as f32
+                        )),
+                )
+                .child(Slider::new(&self.timeline)),
+        )
+    }
+}
+
+/// Blurs the whole window natively: Core Image filters on GPUI's backing `CAMetalLayer`,
+/// applied by the window server on the GPU, with grain fading along with the blur.
+/// `holes` (window coordinates) stay sharp. A radius of `0` removes it.
+#[cfg(target_os = "macos")]
+fn set_window_blur(window: &Window, radius: f32, backdrop: Hsla, holes: &[Bounds<Pixels>]) {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSColor, NSView};
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_core_image::{CIColor, CIFilter, CIImage};
+    use objc2_foundation::{NSArray, NSNumber, NSObjectNSKeyValueCoding as _, ns_string};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's AppKit handle is its live content view, and render runs on the main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(layer) = view.layer() else { return };
+    if radius <= 0. {
+        unsafe { layer.setFilters(None) };
+        return;
+    }
+    if layer.filters().is_none_or(|filters| filters.count() == 0) {
+        view.setLayerUsesCoreImageFilters(true);
+        // Grain goes after the blur, so it stays crisp; drawn in GPUI it would be
+        // blurred into a flat grey veil.
+        let filter = |name| unsafe { CIFilter::filterWithName(name) };
+        let (Some(blur), Some(grain)) = (
+            filter(ns_string!("CIMaskedVariableBlur")),
+            filter(ns_string!("CIDither")),
+        ) else {
+            return;
+        };
+        unsafe {
+            blur.setName(ns_string!("blur"));
+            grain.setName(ns_string!("grain"));
+            layer.setFilters(Some(&NSArray::from_slice(&[&*blur as &AnyObject, &*grain])));
+        }
+        // The blur pulls transparency in at the edges, where the window's own background
+        // shows; match it to the content so the edges don't darken.
+        let c = Rgba::from(backdrop);
+        let color =
+            NSColor::colorWithSRGBRed_green_blue_alpha(c.r.into(), c.g.into(), c.b.into(), 1.);
+        if let Some(ns_window) = view.window() {
+            ns_window.setBackgroundColor(Some(&color));
+        }
+    }
+    // The mask scales the radius per pixel: white blurs fully, black stays sharp.
+    // Core Image's origin is bottom-left.
+    let size = window.viewport_size();
+    let height = f32::from(size.height);
+    // Finite: the filter is archived to the window server, which rejects infinite images.
+    // Twice the window size, covering points or pixels alike.
+    let extent = CGRect::new(
+        CGPoint::new(0., 0.),
+        CGSize::new((f32::from(size.width) * 2.).into(), (height * 2.).into()),
+    );
+    let mask = holes.iter().fold(
+        unsafe { CIImage::imageWithColor(&CIColor::whiteColor()).imageByCroppingToRect(extent) },
+        |mask, hole| {
+            let rect = CGRect::new(
+                CGPoint::new(
+                    f32::from(hole.origin.x).into(),
+                    (height - f32::from(hole.bottom())).into(),
+                ),
+                CGSize::new(
+                    f32::from(hole.size.width).into(),
+                    f32::from(hole.size.height).into(),
+                ),
+            );
+            unsafe {
+                CIImage::imageWithColor(&CIColor::blackColor())
+                    .imageByCroppingToRect(rect)
+                    .imageByCompositingOverImage(&mask)
+            }
+        },
+    );
+    unsafe {
+        // A scalar, unlike a noise image, which is costly to send each frame.
+        layer.setValue_forKeyPath(
+            Some(&NSNumber::new_f32(NATIVE_GRAIN * radius / INTRO_BLUR)),
+            ns_string!("filters.grain.inputIntensity"),
+        );
+        layer.setValue_forKeyPath(Some(&mask), ns_string!("filters.blur.inputMask"));
+        layer.setValue_forKeyPath(
+            Some(&NSNumber::new_f32(radius)),
+            ns_string!("filters.blur.inputRadius"),
+        );
     }
 }
 
