@@ -339,6 +339,90 @@ fn timer(text: String) -> Div {
         .child(text)
 }
 
+/// How far a digit travels when it rolls in or out.
+const ROLL: f32 = 36.;
+
+/// The timer with each character in its own slot, so a changed digit rolls: the old
+/// one slides out and fades while the new one slides in. `down` sets the direction.
+/// Shift that centers a digit's ink in its slot. Helvetica Neue's figures are tabular,
+/// but its narrow "1" sits 0.076em left of center, leaving a gap before the colon.
+fn ink_shift(c: char) -> Pixels {
+    px(if c == '1' { 0.076 * TIMER_SIZE } else { 0. })
+}
+
+fn rolling_timer(slots: &[Slot], down: bool) -> Div {
+    let dir = if down { 1. } else { -1. };
+    timer(String::new())
+        .flex()
+        .children(slots.iter().enumerate().map(|(i, slot)| {
+            let ch = slot.shown.to_string();
+            let shift = ink_shift(slot.shown);
+            if slot.rolls == 0 {
+                return div().relative().left(shift).child(ch).into_any_element();
+            }
+            let id = |part| SharedString::from(format!("digit-{part}-{i}-{}", slot.rolls));
+            let roll = || Animation::new(Duration::from_millis(450)).with_easing(ease_out_quint());
+            div()
+                .relative()
+                .child(div().relative().left(shift).child(ch).with_animation(
+                    id("in"),
+                    roll(),
+                    move |el, t| el.top(px(-dir * ROLL * (1. - t))).opacity(t),
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .left(ink_shift(slot.previous))
+                        .child(slot.previous.to_string())
+                        .with_animation(id("out"), roll(), move |el, t| {
+                            el.top(px(dir * ROLL * t)).opacity((1. - t * 1.6).max(0.))
+                        }),
+                )
+                .into_any_element()
+        }))
+}
+
+/// Diffs `time` against the shown slots, starting a roll for each changed character.
+/// Returns whether it rolls down, or `None` if nothing rolls.
+fn roll(slots: &mut Vec<Slot>, time: &str) -> Option<bool> {
+    if slots.len() != time.len() {
+        // First render (or minutes gained a digit): show as-is, nothing to roll from.
+        *slots = time
+            .chars()
+            .map(|c| Slot {
+                shown: c,
+                previous: c,
+                rolls: 0,
+            })
+            .collect();
+        return None;
+    }
+    let shown: String = slots.iter().map(|s| s.shown).collect();
+    if shown == time {
+        return None;
+    }
+    for (slot, c) in slots.iter_mut().zip(time.chars()) {
+        if slot.shown != c {
+            *slot = Slot {
+                shown: c,
+                previous: slot.shown,
+                rolls: slot.rolls + 1,
+            };
+        }
+    }
+    // Same "MM:SS" shape, so string order is time order: counting down rolls down.
+    Some(time < shown.as_str())
+}
+
+/// One character of the timer, plus what it showed before its last change.
+#[derive(Clone, Copy)]
+struct Slot {
+    shown: char,
+    previous: char,
+    /// Bumped on every change; restarts the roll animation.
+    rolls: usize,
+}
+
 // Lucide, inlined: the default `assets::Assets` bundle doesn't include these.
 const CLOCK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>"##;
 const VOLUME: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></svg>"##;
@@ -581,6 +665,9 @@ struct Pomodoro {
     from: Stage,
     switches: usize,
     grain: Arc<Image>,
+    /// Timer characters as last rendered, and whether the latest change rolled down.
+    slots: Vec<Slot>,
+    rolls_down: bool,
     /// Paused time left; `None` means the stage hasn't started yet.
     remaining: Option<Duration>,
     ends_at: Option<Instant>,
@@ -613,6 +700,8 @@ impl Pomodoro {
             from: Stage::Work,
             switches: 0,
             grain: Arc::new(Image::from_bytes(ImageFormat::Svg, GRAIN.to_vec())),
+            slots: Vec::new(),
+            rolls_down: true,
             remaining: None,
             ends_at: None,
             works_done: 0,
@@ -774,6 +863,9 @@ impl Render for Pomodoro {
         });
 
         let time = self.time_text(cx);
+        if let Some(down) = roll(&mut self.slots, &time) {
+            self.rolls_down = down;
+        }
         let scrub = self.scrub;
         v_flex()
             .relative()
@@ -803,7 +895,7 @@ impl Render for Pomodoro {
                 0.1,
                 16.,
                 scrub,
-                timer(time.clone()),
+                rolling_timer(&self.slots, self.rolls_down),
                 move |sigma| blurred_timer(time.clone(), sigma),
             ))
             .child(reveal(
@@ -933,7 +1025,33 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Saved, Stage, next_stage};
+    use super::{Saved, Stage, next_stage, roll};
+
+    #[test]
+    fn rolls_only_changed_digits_in_time_direction() {
+        let mut slots = Vec::new();
+        assert_eq!(roll(&mut slots, "25:00"), None);
+        assert_eq!(roll(&mut slots, "25:00"), None);
+
+        assert_eq!(roll(&mut slots, "24:59"), Some(true));
+        let rolled: Vec<_> = slots
+            .iter()
+            .map(|s| (s.previous, s.shown, s.rolls))
+            .collect();
+        assert_eq!(
+            rolled,
+            [
+                ('2', '2', 0),
+                ('5', '4', 1),
+                (':', ':', 0),
+                ('0', '5', 1),
+                ('0', '9', 1)
+            ]
+        );
+
+        assert_eq!(roll(&mut slots, "25:00"), Some(false));
+        assert_eq!(slots[1].rolls, 2);
+    }
 
     #[test]
     fn saved_settings_round_trip_and_fill_missing_keys() {
