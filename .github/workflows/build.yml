@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test --locked
+      - run: cargo install cargo-bundle --locked
+      - run: cargo bundle --release
+      - run: codesign --force --deep -s - target/release/bundle/osx/Pomominders.app
+
+      # ditto keeps the bundle's symlinks and metadata intact
+      - run: ditto -c -k --keepParent target/release/bundle/osx/Pomominders.app Pomominders.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pomominders-macos
+          path: Pomominders.zip
