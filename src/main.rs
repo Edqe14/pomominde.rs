@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -454,6 +454,7 @@ struct Slot {
 
 // Lucide, inlined: the default `assets::Assets` bundle doesn't include these.
 const CLOCK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>"##;
+const BELL: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>"##;
 const VOLUME: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></svg>"##;
 
 /// Width of the settings control column, so every control shares one right edge.
@@ -513,17 +514,23 @@ struct Saved {
     auto_start: bool,
     /// 0..=100
     alarm_volume: f32,
+    notify: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Self::new(SETTINGS.map(|(_, default)| default), false, 100.)
+        Self::new(SETTINGS.map(|(_, default)| default), false, 100., true)
     }
 }
 
 impl Saved {
     /// `values` are indexed like `SETTINGS`.
-    fn new([work, short, long, interval]: [u64; 4], auto_start: bool, alarm_volume: f32) -> Self {
+    fn new(
+        [work, short, long, interval]: [u64; 4],
+        auto_start: bool,
+        alarm_volume: f32,
+        notify: bool,
+    ) -> Self {
         Self {
             work_minutes: work,
             short_break_minutes: short,
@@ -531,6 +538,7 @@ impl Saved {
             long_break_interval: interval,
             auto_start,
             alarm_volume,
+            notify,
         }
     }
 
@@ -569,11 +577,317 @@ impl Saved {
     }
 }
 
+const CLOSE: f32 = 28.;
+const PILL_W: f32 = 72.;
+const PILL_H: f32 = 32.;
+/// How long the Start pill takes to fill before starting the next stage on its own.
+const AUTO_START: Duration = Duration::from_secs(5);
+/// Pause between the toast appearing and its countdown (or linger) starting.
+const LEAD_IN: Duration = Duration::from_millis(300);
+/// How long a toast without the countdown stays up.
+const TOAST_LINGER: Duration = Duration::from_secs(20);
+const CLOSE_ICON: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round"><path d="M17 7 7 17M7 7l10 10"/></svg>"##;
+
+/// Stage-end notice in the top-right corner. Our own always-on-top panel rather than a
+/// system notification, so Focus modes don't silence it.
+struct Toast {
+    ended: Stage,
+    next: Stage,
+    timer: WeakEntity<Pomodoro>,
+    /// Start fills over `AUTO_START`, then starts the next stage.
+    auto_start: bool,
+    /// When the countdown (or linger) began: once macOS reports the panel on screen, plus
+    /// `LEAD_IN`. Counting from window creation instead loses the first part to the panel
+    /// still appearing.
+    begins: Option<Instant>,
+    _visible: Subscription,
+    _close: Option<Task<()>>,
+}
+
+impl Toast {
+    fn new(
+        ended: Stage,
+        next: Stage,
+        timer: WeakEntity<Pomodoro>,
+        auto_start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let _visible = cx.observe_window_visibility(window, |this, visibility, window, cx| {
+            if visibility.is_visible() {
+                this.begin(window, cx)
+            }
+        });
+        Self {
+            ended,
+            next,
+            timer,
+            auto_start,
+            begins: None,
+            _visible,
+            _close: None,
+        }
+    }
+
+    fn begin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.begins.is_some() {
+            return;
+        }
+        self.begins = Some(Instant::now() + LEAD_IN);
+        let (auto_start, timer) = (self.auto_start, self.timer.clone());
+        let wait = LEAD_IN + if auto_start { AUTO_START } else { TOAST_LINGER };
+        // Dropped with the toast, so × (which so cancels the auto start), Start and a newer
+        // toast all stop it.
+        self._close = Some(cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = cx.update(|window, cx| {
+                if auto_start {
+                    let _ = timer.update(cx, |t, cx| {
+                        if !t.running() {
+                            t.start(cx)
+                        }
+                    });
+                }
+                window.remove_window();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// 0..=1 through the countdown; 0 until it begins.
+    fn progress(&self) -> f32 {
+        self.begins.map_or(0., |begins| {
+            let elapsed = Instant::now().saturating_duration_since(begins);
+            (elapsed.as_secs_f32() / AUTO_START.as_secs_f32()).min(1.)
+        })
+    }
+}
+
+impl Render for Toast {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = self.timer.upgrade().is_some_and(|t| t.read(cx).running());
+        let timer = self.timer.clone();
+        let next = match self.next {
+            Stage::Work => "Back to work.",
+            Stage::Short => "Time for a short break.",
+            Stage::Long => "Time for a long break.",
+        };
+
+        // Same pill as the stage tabs, at its active weight.
+        // Fallback in case the panel was already on screen before the observer existed.
+        if window.is_visible() {
+            self.begin(window, cx);
+        }
+        let (next_color, auto_start, t) = (self.next.color(), self.auto_start, self.progress());
+        if auto_start && t < 1. {
+            window.request_animation_frame();
+        }
+        let start = (!running).then(|| {
+            let (el, target) = pressable("toast-start", window, cx);
+            el.on_click(move |_, window, cx| {
+                if let Some(timer) = timer.upgrade() {
+                    timer.update(cx, |t, cx| {
+                        if !t.running() {
+                            t.start(cx)
+                        }
+                    });
+                }
+                window.remove_window();
+            })
+            .with_spring(
+                "toast-start",
+                SpringAnimation::new(SPRING).to(target),
+                move |el, v| {
+                    let (hover, press) = hover_press(v);
+                    let label = || {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .w(px(PILL_W))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("Start")
+                    };
+                    el.child(
+                        div()
+                            .relative()
+                            .w(px(PILL_W))
+                            .h(px(PILL_H))
+                            .rounded_full()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(faded(0.15 + 0.08 * hover + 0.07 * press))
+                            .text_color(faded(0.9 + 0.1 * hover))
+                            .child(label())
+                            // Countdown: an opaque copy of the pill, label in the stage color,
+                            // revealed left to right by a clip that grows from zero width.
+                            .when(auto_start && t > 0., |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .h_full()
+                                        .w(px(PILL_W * t))
+                                        .overflow_hidden()
+                                        .child(
+                                            label()
+                                                .rounded_full()
+                                                .bg(faded(1.))
+                                                .text_color(next_color),
+                                        ),
+                                )
+                            }),
+                    )
+                },
+            )
+        });
+
+        // A small `icon_button`: same hover disc and press shrink.
+        let (el, target) = pressable("toast-close", window, cx);
+        let close = el
+            .size(px(CLOSE))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(|_, window, _| window.remove_window())
+            .with_spring(
+                "toast-close",
+                SpringAnimation::new(SPRING).to(target),
+                |el, v| {
+                    let (hover, press) = hover_press(v);
+                    let scale = 1. - 0.08 * press;
+                    el.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded_full()
+                            .bg(faded(0.08 * hover + 0.07 * press)),
+                    )
+                    .child(
+                        Icon::default()
+                            .data(CLOSE_ICON)
+                            .size(px(CLOSE * 0.6))
+                            .text_color(faded(0.6 + 0.3 * hover))
+                            .transform(Transformation::scale(size(scale, scale))),
+                    )
+                },
+            );
+
+        // The next stage's own canvas, so the toast reads as a piece of the timer window.
+        h_flex()
+            .size_full()
+            .gap_3()
+            .pl_4()
+            .pr_3()
+            .rounded(px(16.))
+            .bg(self.next.color())
+            .border_1()
+            .border_color(faded(0.12))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(faded(0.95))
+                            .child(format!("{} is over", self.ended.label())),
+                    )
+                    .child(div().text_xs().text_color(faded(0.8)).child(next)),
+            )
+            .child(h_flex().gap_1().children(start).child(close))
+    }
+}
+
+// ponytail: stays until dismissed, on the primary display only; add a timeout or follow the
+// active screen if that turns out to matter.
+fn show_toast(
+    ended: Stage,
+    next: Stage,
+    timer: WeakEntity<Pomodoro>,
+    auto_start: bool,
+    cx: &mut App,
+) -> Option<AnyWindowHandle> {
+    let display = cx.primary_display()?;
+    let area = display.visible_bounds();
+    let size = size(px(356.), px(64.));
+    let origin = point(area.right() - size.width - px(16.), area.top() + px(16.));
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, size))),
+        titlebar: None,
+        focus: false,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        display_id: Some(display.id()),
+        window_background: WindowBackgroundAppearance::Transparent,
+        ..Default::default()
+    };
+    // Plain `cx.open_window`, not gpui-kit's: its Root paints an opaque background, which
+    // would fill the transparent corners around the rounded card.
+    let handle = cx
+        .open_window(options, |window, cx| {
+            #[cfg(target_os = "macos")]
+            style_toast_panel(window);
+            cx.new(|cx| Toast::new(ended, next, timer, auto_start, window, cx))
+        })
+        .ok()?;
+    Some(handle.into())
+}
+
+/// GPUI's pop-up is an NSPanel, which hides whenever the app isn't frontmost (the toast must
+/// show precisely then). GPUI also always makes it titled, so macOS draws a window frame and
+/// shadow around the card's transparent corners; borderless drops both.
+#[cfg(target_os = "macos")]
+fn style_toast_panel(window: &Window) {
+    use objc2_app_kit::{NSView, NSWindowStyleMask};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's AppKit handle is its live content view, on the main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    if let Some(window) = view.window() {
+        window.setHidesOnDeactivate(false);
+        window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        window.setHasShadow(false);
+    }
+}
+
+/// `volume` is 0.0..=1.0.
+// ponytail: afplay needs a file, so the embedded mp3 is written to the temp dir on each
+// play; swap for rodio if other platforms matter.
+fn play_alarm(volume: f32) -> Option<Child> {
+    let alarm = std::env::temp_dir().join("pomominders-alarm.mp3");
+    std::fs::write(&alarm, include_bytes!("../assets/alarm.mp3")).ok()?;
+    Command::new("afplay")
+        .arg("-v")
+        .arg(volume.to_string())
+        .arg(&alarm)
+        .spawn()
+        .ok()
+}
+
 /// Rendered inside the settings dialog; its own view so controls re-render while it's open.
 struct Settings {
     inputs: [Entity<InputState>; 4],
     auto_start: bool,
+    notify: bool,
     volume: Entity<SliderState>,
+    /// Volume preview still playing; stopped before the next one starts. The slider can
+    /// report one release twice (mouse and trackpad touch paths), which would otherwise overlap.
+    preview: Option<Child>,
 }
 
 impl Settings {
@@ -603,7 +917,14 @@ impl Settings {
                 .step(1.)
                 .default_value(saved.alarm_volume.clamp(0., 100.))
         });
-        cx.subscribe(&volume, |this, _, _: &SliderEvent, cx| {
+        cx.subscribe(&volume, |this, _, event: &SliderEvent, cx| {
+            if let SliderEvent::Release(value) = event {
+                if let Some(mut old) = this.preview.take() {
+                    let _ = old.kill();
+                    let _ = old.wait();
+                }
+                this.preview = play_alarm(value.end() / 100.);
+            }
             this.save(cx);
             cx.notify();
         })
@@ -611,7 +932,9 @@ impl Settings {
         Self {
             inputs,
             auto_start: saved.auto_start,
+            notify: saved.notify,
             volume,
+            preview: None,
         }
     }
 
@@ -620,6 +943,7 @@ impl Settings {
             std::array::from_fn(|i| self.get(i, cx)),
             self.auto_start,
             self.volume.read(cx).value().end(),
+            self.notify,
         )
         .store();
     }
@@ -661,7 +985,8 @@ impl Render for Settings {
                     .child(number(INTERVAL, "Work sessions before a long break"))
                     .child(setting_row(
                         "Auto start sessions",
-                        None,
+                        self.notify
+                            .then_some("After a countdown in the notification"),
                         Switch::new("auto-start")
                             .checked(self.auto_start)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -682,6 +1007,24 @@ impl Render for Settings {
                         None,
                         // Inset so the thumb's overhang stays inside the control column.
                         div().w_full().px_2().child(Slider::new(&self.volume)),
+                        cx,
+                    )),
+            )
+            .child(div().h_px().bg(cx.theme().border))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(group_header(BELL, "Notifications", cx))
+                    .child(setting_row(
+                        "Show notification",
+                        Some("When a session ends"),
+                        Switch::new("notify")
+                            .checked(self.notify)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.notify = *checked;
+                                this.save(cx);
+                                cx.notify();
+                            })),
                         cx,
                     )),
             )
@@ -711,6 +1054,8 @@ struct Pomodoro {
     works_done: u64,
     settings: Entity<Settings>,
     ticker: Option<Task<()>>,
+    /// Stage-end toast currently on screen, replaced by the next one.
+    toast: Option<AnyWindowHandle>,
     /// Debug panel slider (debug builds only), scrubbing the intro.
     #[cfg(debug_assertions)]
     timeline: Entity<SliderState>,
@@ -754,6 +1099,7 @@ impl Pomodoro {
             ends_at: None,
             works_done: 0,
             settings,
+            toast: None,
             ticker: None,
             #[cfg(debug_assertions)]
             timeline,
@@ -804,6 +1150,12 @@ impl Pomodoro {
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
+        // Started from anywhere, the stage-end toast has done its job.
+        if let Some(toast) = self.toast.take() {
+            cx.defer(move |cx| {
+                let _ = toast.update(cx, |_, window, _| window.remove_window());
+            });
+        }
         self.ends_at = Some(Instant::now() + self.left(cx));
         // Idle counts from starting, so the pause button shows briefly before fading.
         self.moved_at = Instant::now();
@@ -849,22 +1201,28 @@ impl Pomodoro {
         if !self.left(cx).is_zero() {
             return cx.notify();
         }
-        // ponytail: macOS system sound via afplay; swap for rodio if other platforms matter
         let settings = self.settings.read(cx);
-        let (volume, auto_start) = (settings.volume(cx), settings.auto_start);
-        let _ = Command::new("afplay")
-            .args([
-                "-v",
-                &volume.to_string(),
-                "/System/Library/Sounds/Glass.aiff",
-            ])
-            .spawn();
+        let (volume, auto_start, notify) =
+            (settings.volume(cx), settings.auto_start, settings.notify);
+        play_alarm(volume);
         if self.stage == Stage::Work {
             self.works_done += 1;
         }
         let next = next_stage(self.stage, self.works_done, self.setting(INTERVAL, cx));
+        if notify {
+            let (ended, old, timer) = (self.stage, self.toast.take(), cx.entity().downgrade());
+            // Deferred: opening a window while this view is mid-update would re-borrow it.
+            cx.defer(move |cx| {
+                if let Some(old) = old {
+                    let _ = old.update(cx, |_, window, _| window.remove_window());
+                }
+                let toast = show_toast(ended, next, timer.clone(), auto_start, cx);
+                let _ = timer.update(cx, |this, _| this.toast = toast);
+            });
+        }
         self.set_stage(next, cx);
-        if auto_start {
+        // With a toast, auto start waits for its countdown instead.
+        if auto_start && !notify {
             self.start(cx);
         }
     }
@@ -1293,15 +1651,20 @@ mod tests {
 
     #[test]
     fn saved_settings_round_trip_and_fill_missing_keys() {
-        let saved = Saved::new([50, 10, 20, 3], true, 40.);
+        let saved = Saved::new([50, 10, 20, 3], true, 40., false);
         let back: Saved = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
         assert_eq!(
-            (back.values(), back.auto_start, back.alarm_volume),
-            ([50, 10, 20, 3], true, 40.)
+            (
+                back.values(),
+                back.auto_start,
+                back.alarm_volume,
+                back.notify
+            ),
+            ([50, 10, 20, 3], true, 40., false)
         );
 
         let partial: Saved = toml::from_str("work_minutes = 30").unwrap();
-        assert_eq!(partial.values(), [30, 5, 15, 4]);
+        assert_eq!((partial.values(), partial.notify), ([30, 5, 15, 4], true));
     }
 
     #[test]
